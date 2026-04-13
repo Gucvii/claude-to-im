@@ -1,10 +1,30 @@
 {
-  "name": "claude-to-im",
+  "name": "@gucvii/claude-to-im",
   "version": "0.1.0",
   "description": "Host-agnostic bridge connecting Claude Code SDK to IM platforms (Telegram, Discord, Feishu)",
   "type": "module",
   "main": "dist/lib/bridge/context.js",
   "types": "dist/lib/bridge/context.d.ts",
+  "author": "gucvii",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gucvii/claude-to-im.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Gucvii/claude-to-im/issues"
+  },
+  "homepage": "https://github.com/Gucvii/claude-to-im#readme",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "telegram",
+    "discord",
+    "feishu",
+    "lark",
+    "im-bridge",
+    "chatbot"
+  ],
   "exports": {
     ".": {
       "types": "./dist/lib/bridge/context.d.ts",

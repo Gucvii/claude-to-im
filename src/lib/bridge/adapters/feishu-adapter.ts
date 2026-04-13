@@ -120,6 +120,44 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
+  /** Maps permissionRequestId to CardKit card_id for UI updates. */
+  private permissionCardIds = new Map<string, string>();
+
+  private async getTenantToken(): Promise<string | null> {
+    if (!this.restClient) return null;
+    try {
+      const token = await (this.restClient as any).tokenManager.getTenantAccessToken();
+      return token || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getBaseUrl(): string {
+    return (this.restClient as any)?.domain || 'https://open.feishu.cn';
+  }
+
+  private async createCardkitCard(cardJson: string): Promise<string | null> {
+    if (!this.restClient) return null;
+    const token = await this.getTenantToken();
+    if (!token) return null;
+    const baseUrl = this.getBaseUrl();
+    try {
+      const resp = await fetch(`${baseUrl}/open-apis/cardkit/v1/cards`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ type: 'card_json', data: cardJson }),
+      });
+      const data: any = resp.ok ? await resp.json().catch(() => null) : null;
+      return data?.data?.card_id || null;
+    } catch (err) {
+      console.warn('[feishu-adapter] createCardkitCard failed:', err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -156,8 +194,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       'im.message.receive_v1': async (data) => {
         await this.handleIncomingEvent(data as FeishuMessageEventData);
       },
-      'card.action.trigger': (async (data: unknown) => {
-        return await this.handleCardAction(data);
+      'card.action.trigger': ((data: unknown) => {
+        return this.handleCardAction(data);
       }) as any,
     });
 
@@ -171,10 +209,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Monkey-patch WSClient.handleEventData to support card action events (type: "card").
     // The SDK's WSClient only processes type="event" messages. Card action callbacks
     // arrive as type="card" and would be silently dropped without this patch.
+    // We also temporarily patch sendMessage so the response goes back with type="card",
+    // otherwise Feishu cannot match the response to the original card action request.
     const wsClientAny = this.wsClient as any;
     if (typeof wsClientAny.handleEventData === 'function') {
       const origHandleEventData = wsClientAny.handleEventData.bind(wsClientAny);
-      wsClientAny.handleEventData = (data: any) => {
+      wsClientAny.handleEventData = async (data: any) => {
         const msgType = data.headers?.find?.((h: any) => h.key === 'type')?.value;
         if (msgType === 'card') {
           console.log('[feishu-adapter] handleEventData type: card (patched → event)');
@@ -184,7 +224,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
               h.key === 'type' ? { ...h, value: 'event' } : h,
             ),
           };
-          return origHandleEventData(patchedData);
+          const origSendMessage = wsClientAny.sendMessage.bind(wsClientAny);
+          wsClientAny.sendMessage = (responseData: any) => {
+            const restoredHeaders = responseData.headers.map((h: any) =>
+              h.key === 'type' ? { ...h, value: 'card' } : h,
+            );
+            return origSendMessage({ ...responseData, headers: restoredHeaders });
+          };
+          try {
+            return await origHandleEventData(patchedData);
+          } finally {
+            wsClientAny.sendMessage = origSendMessage;
+          }
         }
         return origHandleEventData(data);
       };
@@ -222,6 +273,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
     this.activeCards.clear();
     this.cardCreatePromises.clear();
+    this.permissionCardIds.clear();
 
     // Clear state
     this.seenMessageIds.clear();
@@ -314,7 +366,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Converts button clicks to synthetic InboundMessage with callbackData.
    * Must return within 3 seconds (Feishu timeout), so uses a 2.5s race.
    */
-  private async handleCardAction(data: unknown): Promise<unknown> {
+  private handleCardAction(data: unknown): unknown {
     const FALLBACK_TOAST = { toast: { type: 'info' as const, content: '已收到' } };
 
     try {
@@ -374,7 +426,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!this.restClient) return false;
 
     try {
-      // Step 1: Create card via CardKit v2
+      // Step 1: Create card via CardKit v1
       const cardBody = {
         schema: '2.0',
         config: {
@@ -393,12 +445,25 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
       };
 
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
-        data: { type: 'card_json', data: JSON.stringify(cardBody) },
+      const token = await this.getTenantToken();
+      if (!token) {
+        console.warn('[feishu-adapter] No tenant token for card creation');
+        return false;
+      }
+      const baseUrl = this.getBaseUrl();
+      const createResp = await fetch(`${baseUrl}/open-apis/cardkit/v1/cards`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ type: 'card_json', data: JSON.stringify(cardBody) }),
       });
-      const cardId = createResp?.data?.card_id;
+      const createData: any = createResp.ok ? await createResp.json().catch(() => null) : null;
+      const cardId = createData?.data?.card_id;
       if (!cardId) {
-        console.warn('[feishu-adapter] Card create returned no card_id');
+        const errorBody = createResp.ok ? JSON.stringify(createData) : await createResp.text().catch(() => 'unknown');
+        console.warn('[feishu-adapter] Card create returned no card_id, status:', createResp.status, errorBody);
         return false;
       }
 
@@ -484,7 +549,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   /**
    * Flush pending card update to Feishu API.
    */
-  private flushCardUpdate(chatId: string): void {
+  private async flushCardUpdate(chatId: string): Promise<void> {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
 
@@ -495,9 +560,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cardId = state.cardId;
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
-      data: { content, sequence: seq },
+    const token = await this.getTenantToken();
+    if (!token) return;
+
+    const baseUrl = this.getBaseUrl();
+    fetch(`${baseUrl}/open-apis/cardkit/v1/cards/${cardId}/elements/streaming_content/content`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ content, sequence: seq }),
     }).then(() => {
       state.lastUpdateAt = Date.now();
     }).catch((err: unknown) => {
@@ -539,12 +612,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
       state.throttleTimer = null;
     }
 
+    const token = await this.getTenantToken();
+    if (!token) {
+      console.warn('[feishu-adapter] No tenant token for card finalize');
+      return false;
+    }
+    const baseUrl = this.getBaseUrl();
+
     try {
       // Step 1: Close streaming mode
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
-        path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
+      await fetch(`${baseUrl}/open-apis/cardkit/v1/cards/${state.cardId}/settings`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ settings: JSON.stringify({ streaming_mode: false }), sequence: state.sequence }),
       });
 
       // Step 2: Build and apply final card
@@ -562,9 +646,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
-        path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+      await fetch(`${baseUrl}/open-apis/cardkit/v1/cards/${state.cardId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ card: { type: 'card_json', data: finalCardJson }, sequence: state.sequence }),
       });
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
@@ -765,24 +853,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
       : '';
 
     if (permId) {
-      // Use real card action buttons
+      // Use real card action buttons via CardKit instance so we can update it later
       const cardJson = buildPermissionButtonCard(mdText, permId, chatId);
-
-      try {
-        const res = await this.restClient.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardJson,
-          },
-        });
-        if (res?.data?.message_id) {
-          return { ok: true, messageId: res.data.message_id };
+      const cardId = await this.createCardkitCard(cardJson);
+      if (cardId) {
+        this.permissionCardIds.set(permId, cardId);
+        const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+        try {
+          const res = await this.restClient.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'interactive',
+              content,
+            },
+          });
+          if (res?.data?.message_id) {
+            return { ok: true, messageId: res.data.message_id };
+          }
+          console.warn('[feishu-adapter] Permission card message send failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
+        } catch (err) {
+          console.warn('[feishu-adapter] Permission card message send error:', err instanceof Error ? err.message : err);
         }
-        console.warn('[feishu-adapter] Permission button card send failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
-      } catch (err) {
-        console.warn('[feishu-adapter] Permission button card error, falling back to text:', err instanceof Error ? err.message : err);
       }
     }
 
@@ -866,6 +958,57 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { ok: false, error: res?.msg || 'Send failed' };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
+  }
+
+  /**
+   * Update a permission card to reflect its resolved state.
+   * Called by bridge-manager after the user clicks an action button.
+   */
+  async updatePermissionCard(
+    permissionRequestId: string,
+    action: 'allow' | 'allow_session' | 'deny',
+  ): Promise<void> {
+    const cardId = this.permissionCardIds.get(permissionRequestId);
+    if (!cardId || !this.restClient) return;
+
+    const statusMap: Record<string, { label: string; color: string }> = {
+      allow: { label: '✅ Allowed', color: 'green' },
+      allow_session: { label: '✅ Allowed for session', color: 'green' },
+      deny: { label: '❌ Denied', color: 'red' },
+    };
+    const status = statusMap[action] || { label: '⏰ Timed out', color: 'grey' };
+
+    const resolvedCardJson = JSON.stringify({
+      schema: '2.0',
+      config: { wide_screen_mode: true },
+      header: {
+        template: status.color,
+        title: { tag: 'plain_text', content: status.label },
+      },
+      body: {
+        elements: [
+          { tag: 'markdown', content: `Permission resolved: **${status.label}**` },
+        ],
+      },
+    });
+
+    const token = await this.getTenantToken();
+    if (!token) return;
+    const baseUrl = this.getBaseUrl();
+
+    try {
+      await fetch(`${baseUrl}/open-apis/cardkit/v1/cards/${cardId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ card: { type: 'card_json', data: resolvedCardJson }, sequence: 1 }),
+      });
+      console.log(`[feishu-adapter] Permission card updated: ${cardId} -> ${action}`);
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to update permission card:', err instanceof Error ? err.message : err);
     }
   }
 

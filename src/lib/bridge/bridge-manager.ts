@@ -466,6 +466,18 @@ async function handleMessage(
         parseMode: 'plain',
       };
       await deliver(adapter, confirmMsg);
+
+      // Update the permission card visual state if adapter supports it
+      const cbParts = msg.callbackData.split(':');
+      if (cbParts.length >= 3 && cbParts[0] === 'perm') {
+        const action = cbParts[1] as 'allow' | 'allow_session' | 'deny';
+        const permissionRequestId = cbParts.slice(2).join(':');
+        if (typeof (adapter as any).updatePermissionCard === 'function') {
+          await (adapter as any).updatePermissionCard(permissionRequestId, action).catch((err: unknown) => {
+            console.warn('[bridge-manager] updatePermissionCard failed:', err instanceof Error ? err.message : err);
+          });
+        }
+      }
     }
     ack();
     return;
@@ -522,7 +534,7 @@ async function handleMessage(
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
         const actionMap: Record<string, string> = { '1': 'allow', '2': 'allow_session', '3': 'deny' };
-        const action = actionMap[normalized];
+        const action = actionMap[normalized] as 'allow' | 'allow_session' | 'deny';
         const permId = pendingLinks[0].permissionRequestId;
         const callbackData = `perm:${action}:${permId}`;
         const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
@@ -534,6 +546,12 @@ async function handleMessage(
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
           });
+
+          if (typeof (adapter as any).updatePermissionCard === 'function') {
+            await (adapter as any).updatePermissionCard(permId, action).catch((err: unknown) => {
+              console.warn('[bridge-manager] updatePermissionCard failed:', err instanceof Error ? err.message : err);
+            });
+          }
         } else {
           await deliver(adapter, {
             address: msg.address,
